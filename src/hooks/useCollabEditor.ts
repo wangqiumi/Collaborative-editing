@@ -1,75 +1,107 @@
-import { ref, Ref } from "vue";
+// composables/useCollaborativeEditor.ts
+import { ref, shallowRef, watch, onBeforeUnmount } from "vue";
 import * as Y from "yjs";
 import { WebsocketProvider } from "y-websocket";
+import { Awareness } from "y-protocols/awareness";
+import type { IDomEditor } from "@wangeditor-next/editor";
 
-export function useCollabEditor(
-  roomName: string,
-  user: { id: string; name: string; color: string },
-  initialContent = "<p>请编辑知识库文档</p>"
-) {
-  const editorRef = ref<any>(null);
-  const users = ref<Map<number, any>>(new Map());
+export function useCollabEditor(roomId: string, serverUrl: string) {
+  const editorRef = shallowRef<IDomEditor>();
+  const valueHtml = ref("");
+  const isEditing = ref(false);
 
-  let ydoc: Y.Doc;
-  let provider: WebsocketProvider;
-  let yText: Y.Text;
+  // Yjs 相关变量
+  let ydoc: Y.Doc | null = null;
+  let provider: WebsocketProvider | null = null;
+  let ytext: Y.Text | null = null;
+  let awareness: Awareness | null = null;
+  let isRemoteUpdating = false;
 
-  const startCollab = () => {
+  // 用户信息
+  const userName = `用户${Math.floor(Math.random() * 1000)}`;
+  const getRandomColor = () => {
+    const colors = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#9b59b6"];
+    return colors[Math.floor(Math.random() * colors.length)];
+  };
+
+  const handleCreated = (editor: IDomEditor) => {
+    editorRef.value = editor;
+  };
+
+  const handleStartEditing = () => {
+    isEditing.value = true;
+
     ydoc = new Y.Doc();
-    yText = new Y.Text();
-    const yXmlFragment = ydoc.getXmlFragment("content");
-    yXmlFragment.insert(0, [yText]);
+    provider = new WebsocketProvider(serverUrl, roomId, ydoc);
+    ytext = ydoc.getText("wang");
+    awareness = provider.awareness;
 
-    // 初始化默认内容
-    if (yText.length === 0) {
-      yText.insert(0, initialContent);
+    awareness.setLocalStateField("user", {
+      name: userName,
+      color: getRandomColor(),
+    });
+
+    const interval = setInterval(() => {
+      const editor = editorRef.value;
+      if (!editor || !ytext) return;
+
+      clearInterval(interval);
+
+      // Yjs -> Editor
+      ytext.observe(() => {
+        if (isRemoteUpdating) return;
+        isRemoteUpdating = true;
+        const newHtml = ytext.toString();
+        if (editor && newHtml !== editor.getHtml()) {
+          editor.setHtml(newHtml);
+        }
+        isRemoteUpdating = false;
+      });
+
+      // Editor -> Yjs
+      watch(valueHtml, (val) => {
+        if (isRemoteUpdating) return;
+        if (ytext && val !== ytext.toString()) {
+          ytext.doc?.transact(() => {
+            ytext?.delete(0, ytext.length);
+            ytext?.insert(0, val);
+          });
+        }
+      });
+
+      // 初始化内容
+      const initHtml = ytext.toString();
+      valueHtml.value = initHtml;
+      editor.setHtml(initHtml);
+    }, 100);
+  };
+
+  const handleStopEditing = () => {
+    isEditing.value = false;
+    if (provider) {
+      provider.destroy();
+      provider = null;
     }
-
-    provider = new WebsocketProvider("ws://localhost:1234", roomName, ydoc);
-    provider.awareness.setLocalState(user);
-    provider.awareness.on("change", () => {
-      users.value = new Map(provider.awareness.getStates());
-    });
-
-    provider.once("synced", () => {
-      if (editorRef.value) {
-        editorRef.value.dangerouslyInsertHtml(yText.toString());
-      }
-    });
-
-    yText.observe((event) => {
-      if (editorRef.value && event.transaction.origin !== editorRef.value) {
-        const html = yText.toString();
-        const selection = editorRef.value.selection.save();
-        editorRef.value.dangerouslyInsertHtml(html);
-        editorRef.value.selection.restore(selection);
-      }
-    });
-  };
-
-  const stopCollab = () => {
-    provider?.destroy();
-    ydoc?.destroy();
-    users.value.clear();
-  };
-
-  const handleChange = (editor: any) => {
-    if (!editor || !yText || !ydoc) return;
-    const html = editor.getHtml();
-    const old = yText.toString();
-    if (html !== old) {
-      ydoc.transact(() => {
-        yText.delete(0, yText.length);
-        yText.insert(0, html);
-      }, editor);
+    if (ydoc) {
+      ydoc.destroy();
+      ydoc = null;
     }
+    ytext = null;
   };
+
+  // 自动清理
+  onBeforeUnmount(() => {
+    const editor = editorRef.value;
+    if (editor) editor.destroy();
+    handleStopEditing();
+  });
 
   return {
     editorRef,
-    users,
-    startCollab,
-    stopCollab,
-    handleChange,
+    valueHtml,
+    isEditing,
+    handleCreated,
+    handleStartEditing,
+    handleStopEditing,
   };
 }
